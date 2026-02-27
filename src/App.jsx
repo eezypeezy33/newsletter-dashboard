@@ -162,6 +162,117 @@ function getHeader(headers, name) {
   return h?.value || "";
 }
 
+// ─── SMART CATEGORIZATION ───
+const TOPIC_KEYWORDS = {
+  "Semiconductors": ["semiconductor", "chip", "wafer", "fab", "euv", "lithography", "asml", "tsmc", "intel foundry", "nvidia", "amd", "qualcomm", "broadcom"],
+  "Technology": ["saas", "software", "cloud", "ai ", "artificial intelligence", "machine learning", "tech", "platform", "api", "data center"],
+  "Macro": ["macro", "fed ", "inflation", "gdp", "employment", "jobs", "rates", "treasury", "recession", "cpi", "pmi", "payroll", "economy", "monetary policy", "fiscal"],
+  "Healthcare": ["healthcare", "pharma", "biotech", "fda", "drug", "clinical trial", "hospital", "medical", "health"],
+  "SaaS": ["saas", "arr ", "mrr ", "churn", "subscription", "recurring revenue", "cloud software", "b2b software"],
+  "Special Situations": ["special situation", "activist", "merger", "acquisition", "spinoff", "spin-off", "tender offer", "buyback", "restructuring", "liquidation", "arbitrage"],
+  "Activist": ["activist", "13d", "proxy", "board seat", "shareholder letter", "campaign"],
+  "Airlines": ["airline", "aviation", "flight", "carrier", "boeing", "airbus"],
+  "Emerging Markets": ["emerging market", "brazil", "india", "mexico", "china", "southeast asia", "frontier market", "latam"],
+  "Japan": ["japan", "nikkei", "topix", "yen", "boj", "japanese"],
+  "Quant": ["quant", "systematic", "algorithmic", "hedge fund", "alpha", "factor", "backt"],
+  "Consumer": ["consumer", "retail", "e-commerce", "brand", "cpg", "discretionary", "staples"],
+  "Defense": ["defense", "defence", "military", "aerospace", "dod", "pentagon", "contractor"],
+  "Energy": ["energy", "oil", "gas", "crude", "renewable", "solar", "wind", "nuclear", "opec", "lng"],
+  "Crypto": ["crypto", "bitcoin", "ethereum", "blockchain", "defi", "web3", "token"],
+  "Real Estate": ["real estate", "reit", "property", "housing", "mortgage", "commercial real estate", "cre"],
+  "Financials": ["bank", "insurance", "fintech", "lending", "credit", "capital markets", "ipo"],
+};
+
+const HIGH_RELEVANCE_SIGNALS = [
+  // Investment thesis language
+  /\b(buy|sell|short|long|undervalued|overvalued|upside|downside|catalyst|inflection|mispriced)\b/i,
+  // Specific analysis
+  /\b(dcf|valuation|price target|fair value|sum.of.parts|ev\/ebitda|p\/e|fcf yield|margin expansion)\b/i,
+  // Actionable content
+  /\b(trade idea|investment idea|pitch|thesis|conviction|position|portfolio)\b/i,
+  // Financial metrics deep dive
+  /\b(\d+x\s+(earnings|revenue|fcf|ebitda)|eps\s+of|\d+%\s+(upside|downside|return|yield|margin))\b/i,
+  // Activist / special sit signals
+  /\b(13d|tender offer|activist|proxy fight|spin.?off|buyback|merger arb|deal spread)\b/i,
+];
+
+const LOW_RELEVANCE_SIGNALS = [
+  /\b(unsubscribe|job opening|hiring|career|webinar registration|podcast episode)\b/i,
+  /\b(sponsored|advertisement|promo code|discount|sale ends|limited time)\b/i,
+  /\b(weekly roundup|news recap|headlines|what happened)\b/i,
+];
+
+function detectTopics(text) {
+  const lower = text.toLowerCase();
+  const detected = [];
+  for (const [topic, keywords] of Object.entries(TOPIC_KEYWORDS)) {
+    if (keywords.some(kw => lower.includes(kw))) {
+      detected.push(topic);
+    }
+  }
+  return detected.slice(0, 4); // cap at 4 topics
+}
+
+function scoreRelevance(subject, body, tickers) {
+  const text = `${subject} ${body}`;
+  let score = 0;
+
+  // Tickers mentioned = likely actionable
+  score += Math.min(tickers.length * 2, 6);
+
+  // High relevance signals
+  for (const pattern of HIGH_RELEVANCE_SIGNALS) {
+    if (pattern.test(text)) score += 3;
+  }
+
+  // Low relevance signals
+  for (const pattern of LOW_RELEVANCE_SIGNALS) {
+    if (pattern.test(text)) score -= 4;
+  }
+
+  // Length heuristic: longer = more substantive
+  if (body.length > 1500) score += 1;
+  if (body.length < 200) score -= 1;
+
+  // Number density (financial content has numbers)
+  const numberCount = (text.match(/\d+\.?\d*%|\$\d|¥\d|\d+x\b/g) || []).length;
+  if (numberCount >= 5) score += 2;
+  if (numberCount >= 10) score += 2;
+
+  if (score >= 6) return "high";
+  if (score <= 0) return "low";
+  return "medium";
+}
+
+// ─── FEEDBACK PARSER ───
+function parseFeedback(text, currentArticle) {
+  const lower = text.toLowerCase().trim();
+  const updates = {};
+
+  // Relevance changes
+  if (/\b(high\s*(relevance|priority|importance)|very\s*(relevant|important|useful)|great|excellent|key\s*read|must\s*read)\b/i.test(lower)) {
+    updates.relevance = "high";
+  } else if (/\b(low\s*(relevance|priority|importance)|not\s*(relevant|important|useful)|irrelevant|junk|spam|useless|skip)\b/i.test(lower)) {
+    updates.relevance = "low";
+  } else if (/\b(medium|average|ok|decent|so.so)\b/i.test(lower)) {
+    updates.relevance = "medium";
+  }
+
+  // Topic detection from feedback
+  const feedbackTopics = detectTopics(lower);
+  if (feedbackTopics.length > 0) {
+    const merged = [...new Set([...(currentArticle.topics || []), ...feedbackTopics])];
+    updates.topics = merged.slice(0, 5);
+  }
+
+  // Star/watchlist from feedback
+  if (/\b(watch|track|follow|monitor|add to watchlist|star|save)\b/i.test(lower)) {
+    updates.starred = true;
+  }
+
+  return updates;
+}
+
 function parseGmailToArticle(msg, idx) {
   const headers = msg.payload?.headers || [];
   const subject = getHeader(headers, "Subject") || "(No subject)";
@@ -189,10 +300,15 @@ function parseGmailToArticle(msg, idx) {
 
   const { html, plain } = extractEmailBody(msg.payload || {});
   const snippet = msg.snippet || (plain || "").slice(0, 200);
+  const bodyText = (plain || "").slice(0, 3000);
 
   // Simple ticker detection: find $TICKER patterns in plain text
   const tickerMatches = (plain || "").match(/\$([A-Z]{1,5}(?:\.[A-Z]{1,2})?)/g) || [];
   const tickers = [...new Set(tickerMatches.map(t => t.replace("$", "")))];
+
+  // Smart categorization
+  const topics = detectTopics(`${subject} ${bodyText} ${fromName}`);
+  const relevance = scoreRelevance(subject, bodyText, tickers);
 
   return {
     id: msg.id || String(idx),
@@ -201,10 +317,10 @@ function parseGmailToArticle(msg, idx) {
     source,
     date: dateStr,
     snippet: snippet.slice(0, 250),
-    body: (plain || "").slice(0, 3000),
+    body: bodyText,
     htmlBody: html,
-    topics: [],
-    relevance: "medium",
+    topics,
+    relevance,
     tickers,
     read: false,
     archived: false,
@@ -464,8 +580,10 @@ export default function NewsletterDashboard() {
   };
 
   const handleRate = (id, rating) => {
-    updateArticle(id, { rating });
-    showToast(rating === "up" ? "Rated helpful" : "Rated not useful");
+    // Thumbs up → bump relevance to high; thumbs down → drop to low
+    const relevanceUpdate = rating === "up" ? "high" : "low";
+    updateArticle(id, { rating, relevance: relevanceUpdate });
+    showToast(rating === "up" ? "Rated helpful · relevance → high" : "Rated not useful · relevance → low");
   };
 
   const handleSelect = (id) => {
@@ -475,13 +593,34 @@ export default function NewsletterDashboard() {
 
   const saveFeedbackNote = () => {
     if (!feedbackText.trim()) return;
+
+    // Parse feedback for recategorization signals
+    if (selected) {
+      const updates = parseFeedback(feedbackText, selected);
+      if (Object.keys(updates).length > 0) {
+        updateArticle(selected.id, updates);
+        const changes = [];
+        if (updates.relevance) changes.push(`relevance → ${updates.relevance}`);
+        if (updates.topics) changes.push(`topics updated`);
+        if (updates.starred) changes.push(`added to watchlist`);
+        if (changes.length > 0) {
+          showToast("Note saved · " + changes.join(", "));
+        } else {
+          showToast("Note saved");
+        }
+      } else {
+        showToast("Note saved");
+      }
+    } else {
+      showToast("Note saved");
+    }
+
     setFeedbackNotes(prev => ({
       ...prev,
       [selectedId || "general"]: [...(prev[selectedId || "general"] || []),
         { text: feedbackText, time: new Date().toLocaleTimeString(), articleTitle: selected?.subject || "General" }]
     }));
     setFeedbackText("");
-    showToast("Note saved");
   };
 
   const activeFilterCount = filters.topics.length + filters.sources.length + filters.relevance.length + (filters.search ? 1 : 0);
@@ -883,7 +1022,7 @@ export default function NewsletterDashboard() {
               }}>
                 <input
                   ref={feedbackRef}
-                  type="text" placeholder="Add a note, question, or feedback on this article..."
+                  type="text" placeholder="Add feedback to recategorize (e.g. 'high relevance', 'not useful', 'track this')..."
                   value={feedbackText} onChange={e => setFeedbackText(e.target.value)}
                   onKeyDown={e => e.key === "Enter" && saveFeedbackNote()}
                   style={{
