@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 
 // ─── CONFIG ───
-const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "YOUR_CLIENT_ID.apps.googleusercontent.com";
-const SCOPES = "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.modify";
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID || "";
+const SCOPES = "https://www.googleapis.com/auth/gmail.readonly";
 
 // ─── MOCK DATA (used when not connected to Gmail) ───
 const MOCK_ARTICLES = [
@@ -103,7 +103,7 @@ const MOCK_ARTICLES = [
 
 // ─── UTILITY HELPERS ───
 const ALL_TOPICS = ["Semiconductors", "Technology", "Macro", "Healthcare", "SaaS", "Special Situations", "Activist", "Airlines", "Emerging Markets", "Japan", "Quant", "Industry News", "Consumer", "Defense"];
-const ALL_SOURCES = [...new Set(MOCK_ARTICLES.map(a => a.source))];
+const ALL_SOURCES_DEFAULT = [...new Set(MOCK_ARTICLES.map(a => a.source))];
 const RELEVANCE_LEVELS = ["high", "medium", "low"];
 
 const formatDate = (d) => {
@@ -114,6 +114,105 @@ const formatDate = (d) => {
 const relColor = (r) => r === "high" ? "#c2410c" : r === "medium" ? "#a16207" : "#6b7280";
 const relBg = (r) => r === "high" ? "#fff7ed" : r === "medium" ? "#fefce8" : "#f9fafb";
 
+// ─── GMAIL HELPERS ───
+function decodeBase64Url(str) {
+  const base64 = str.replace(/-/g, "+").replace(/_/g, "/");
+  try {
+    return decodeURIComponent(
+      atob(base64).split("").map(c => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2)).join("")
+    );
+  } catch {
+    return atob(base64);
+  }
+}
+
+function extractEmailBody(payload) {
+  // Try to get text/plain or text/html from parts
+  if (payload.parts) {
+    for (const part of payload.parts) {
+      if (part.mimeType === "text/plain" && part.body?.data) {
+        return decodeBase64Url(part.body.data);
+      }
+      // Recurse into nested parts (multipart/alternative, etc.)
+      if (part.parts) {
+        const nested = extractEmailBody(part);
+        if (nested) return nested;
+      }
+    }
+    // Fallback to text/html
+    for (const part of payload.parts) {
+      if (part.mimeType === "text/html" && part.body?.data) {
+        const html = decodeBase64Url(part.body.data);
+        // Strip HTML tags for plain text
+        const doc = new DOMParser().parseFromString(html, "text/html");
+        return doc.body.textContent || "";
+      }
+    }
+  }
+  // Single-part message
+  if (payload.body?.data) {
+    return decodeBase64Url(payload.body.data);
+  }
+  return "";
+}
+
+function getHeader(headers, name) {
+  const h = headers?.find(h => h.name.toLowerCase() === name.toLowerCase());
+  return h?.value || "";
+}
+
+function parseGmailToArticle(msg, idx) {
+  const headers = msg.payload?.headers || [];
+  const subject = getHeader(headers, "Subject") || "(No subject)";
+  const fromRaw = getHeader(headers, "From") || "Unknown";
+  const dateRaw = getHeader(headers, "Date");
+
+  // Parse "Name <email>" format
+  const fromMatch = fromRaw.match(/^"?([^"<]+)"?\s*<.*>$/);
+  const fromName = fromMatch ? fromMatch[1].trim() : fromRaw.split("@")[0];
+
+  // Guess source from sender
+  const sourceMatch = fromRaw.match(/<(.+)>/);
+  const email = sourceMatch ? sourceMatch[1] : fromRaw;
+  const sourceDomain = email.includes("@") ? email.split("@")[1].split(".")[0] : fromName;
+  const source = fromName.length > 3 ? fromName : sourceDomain;
+
+  // Parse date
+  let dateStr;
+  try {
+    const d = new Date(dateRaw);
+    dateStr = d.toISOString().split("T")[0];
+  } catch {
+    dateStr = new Date().toISOString().split("T")[0];
+  }
+
+  const body = extractEmailBody(msg.payload || {});
+  const snippet = msg.snippet || body.slice(0, 200);
+
+  // Simple ticker detection: find $TICKER patterns
+  const tickerMatches = body.match(/\$([A-Z]{1,5}(?:\.[A-Z]{1,2})?)/g) || [];
+  const tickers = [...new Set(tickerMatches.map(t => t.replace("$", "")))];
+
+  return {
+    id: msg.id || String(idx),
+    subject,
+    from: fromName,
+    source,
+    date: dateStr,
+    snippet: snippet.slice(0, 250),
+    body: body.slice(0, 3000),
+    topics: [],
+    relevance: "medium",
+    tickers,
+    read: false,
+    archived: false,
+    starred: false,
+    rating: null,
+    ideas: [],
+    gmailId: msg.id,
+  };
+}
+
 // ─── MAIN APP ───
 export default function NewsletterDashboard() {
   const [articles, setArticles] = useState(MOCK_ARTICLES);
@@ -122,17 +221,130 @@ export default function NewsletterDashboard() {
   const [showFilters, setShowFilters] = useState(false);
   const [feedbackText, setFeedbackText] = useState("");
   const [feedbackNotes, setFeedbackNotes] = useState({});
-  const [showIdeas, setShowIdeas] = useState(false);
   const [gmailConnected, setGmailConnected] = useState(false);
+  const [gmailEmail, setGmailEmail] = useState("");
   const [loading, setLoading] = useState(false);
   const [toast, setToast] = useState(null);
-  const [view, setView] = useState("inbox"); // inbox | ideas | archived
+  const [view, setView] = useState("inbox");
+  const [accessToken, setAccessToken] = useState(null);
+  const [fetchError, setFetchError] = useState(null);
+  const [emailCount, setEmailCount] = useState(0);
   const feedbackRef = useRef(null);
+  const tokenClientRef = useRef(null);
 
   const showToast = useCallback((msg) => {
     setToast(msg);
     setTimeout(() => setToast(null), 2600);
   }, []);
+
+  // Initialize Google OAuth token client
+  useEffect(() => {
+    if (!GOOGLE_CLIENT_ID) return;
+    const interval = setInterval(() => {
+      if (window.google?.accounts?.oauth2) {
+        clearInterval(interval);
+        tokenClientRef.current = window.google.accounts.oauth2.initTokenClient({
+          client_id: GOOGLE_CLIENT_ID,
+          scope: SCOPES,
+          callback: () => {}, // set dynamically
+        });
+      }
+    }, 200);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Fetch newsletters from Gmail
+  const fetchGmail = useCallback(async (token) => {
+    setLoading(true);
+    setFetchError(null);
+    try {
+      // Search updates category + common newsletter sources
+      const queries = [
+        "category:updates newer_than:14d",
+        "from:substack.com newer_than:14d",
+      ];
+
+      const allMessageIds = new Set();
+      for (const q of queries) {
+        const res = await fetch(
+          `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(q)}&maxResults=30`,
+          { headers: { Authorization: `Bearer ${token}` } }
+        );
+        const data = await res.json();
+        if (data.messages) {
+          data.messages.forEach(m => allMessageIds.add(m.id));
+        }
+      }
+
+      if (allMessageIds.size === 0) {
+        showToast("No newsletters found in the last 2 weeks");
+        setLoading(false);
+        return;
+      }
+
+      setEmailCount(allMessageIds.size);
+
+      // Fetch full message details (limit to 25 to stay fast)
+      const ids = [...allMessageIds].slice(0, 25);
+      const messageFetches = ids.map(id =>
+        fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`, {
+          headers: { Authorization: `Bearer ${token}` }
+        }).then(r => r.json())
+      );
+
+      const messages = await Promise.all(messageFetches);
+      const parsed = messages.map((msg, i) => parseGmailToArticle(msg, i));
+
+      // Sort by date descending
+      parsed.sort((a, b) => b.date.localeCompare(a.date));
+
+      setArticles(parsed);
+      showToast(`Loaded ${parsed.length} newsletters from Gmail`);
+    } catch (err) {
+      console.error("Gmail fetch error:", err);
+      setFetchError(err.message);
+      showToast("Error fetching Gmail: " + err.message);
+    }
+    setLoading(false);
+  }, [showToast]);
+
+  const handleConnectGmail = useCallback(() => {
+    if (!GOOGLE_CLIENT_ID) {
+      showToast("Add VITE_GOOGLE_CLIENT_ID to .env to connect Gmail");
+      return;
+    }
+    if (!tokenClientRef.current) {
+      showToast("Google Sign-In still loading, try again in a moment");
+      return;
+    }
+
+    tokenClientRef.current.callback = async (response) => {
+      if (response.error) {
+        showToast("Auth error: " + response.error);
+        return;
+      }
+      setAccessToken(response.access_token);
+      setGmailConnected(true);
+
+      // Get user email for display
+      try {
+        const profile = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/profile", {
+          headers: { Authorization: `Bearer ${response.access_token}` }
+        }).then(r => r.json());
+        setGmailEmail(profile.emailAddress || "");
+      } catch {}
+
+      fetchGmail(response.access_token);
+    };
+
+    tokenClientRef.current.requestAccessToken({ prompt: "consent" });
+  }, [fetchGmail, showToast]);
+
+  const handleRefresh = useCallback(() => {
+    if (accessToken) {
+      fetchGmail(accessToken);
+    }
+  }, [accessToken, fetchGmail]);
 
   // Filter logic
   const filtered = articles.filter(a => {
@@ -148,7 +360,7 @@ export default function NewsletterDashboard() {
   });
 
   const selected = articles.find(a => a.id === selectedId);
-  const allIdeas = articles.filter(a => a.starred).flatMap(a => a.ideas);
+  const allSources = [...new Set(articles.map(a => a.source))];
 
   const toggleFilter = (type, val) => {
     setFilters(f => ({
@@ -203,14 +415,14 @@ export default function NewsletterDashboard() {
 
   return (
     <div style={{
-      fontFamily: sansFont, background: "#faf9f7", minHeight: "100vh", color: "#1a1a1a",
-      display: "flex", flexDirection: "column"
+      fontFamily: sansFont, background: "#faf9f7", height: "100vh", color: "#1a1a1a",
+      display: "flex", flexDirection: "column", overflow: "hidden"
     }}>
       {/* ─── HEADER ─── */}
       <header style={{
         background: "#fffffe", borderBottom: "1px solid #e8e5e0",
         padding: "16px 32px", display: "flex", alignItems: "center", justifyContent: "space-between",
-        position: "sticky", top: 0, zIndex: 100
+        flexShrink: 0, zIndex: 100
       }}>
         <div style={{ display: "flex", alignItems: "baseline", gap: 16 }}>
           <h1 style={{
@@ -249,23 +461,26 @@ export default function NewsletterDashboard() {
 
           <div style={{ width: 1, height: 24, background: "#e0ddd8", margin: "0 4px" }} />
 
-          {/* Gmail connect */}
-          <button onClick={() => {
-            if (!gmailConnected) {
-              setGmailConnected(true);
-              setLoading(true);
-              setTimeout(() => setLoading(false), 1500);
-              showToast("Using sample data — add your Google Client ID to connect Gmail");
-            } else {
-              setLoading(true);
-              setTimeout(() => { setLoading(false); showToast("Refreshed"); }, 1000);
-            }
-          }} style={{
+          {/* Gmail connection status + button */}
+          {gmailConnected && (
+            <div style={{
+              display: "flex", alignItems: "center", gap: 8, padding: "4px 12px",
+              background: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: 20
+            }}>
+              <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#22c55e" }} />
+              <span style={{ fontSize: 12, color: "#15803d", fontFamily: monoFont }}>
+                {gmailEmail || "Connected"}
+              </span>
+            </div>
+          )}
+
+          <button onClick={gmailConnected ? handleRefresh : handleConnectGmail} style={{
             background: gmailConnected ? "#f0eeeb" : "#c2410c", color: gmailConnected ? "#1a1a1a" : "#fff",
             border: "none", borderRadius: 20, padding: "7px 18px", fontSize: 13,
             fontWeight: 600, cursor: "pointer", fontFamily: sansFont, transition: "all 0.2s",
-            display: "flex", alignItems: "center", gap: 6
-          }}>
+            display: "flex", alignItems: "center", gap: 6,
+            opacity: loading ? 0.7 : 1
+          }} disabled={loading}>
             {loading ? (
               <span style={{ display: "inline-block", width: 14, height: 14, border: "2px solid currentColor", borderTopColor: "transparent", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
             ) : gmailConnected ? "↻ Refresh" : "Connect Gmail"}
@@ -276,7 +491,7 @@ export default function NewsletterDashboard() {
       {/* ─── FILTER BAR ─── */}
       <div style={{
         background: "#fffffe", borderBottom: "1px solid #e8e5e0", padding: "10px 32px",
-        display: "flex", alignItems: "center", gap: 12
+        display: "flex", alignItems: "center", gap: 12, flexShrink: 0
       }}>
         {/* Search */}
         <div style={{ position: "relative", flex: 1, maxWidth: 360 }}>
@@ -334,7 +549,7 @@ export default function NewsletterDashboard() {
       {showFilters && (
         <div style={{
           background: "#fffffe", borderBottom: "1px solid #e8e5e0", padding: "16px 32px",
-          display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 24
+          display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 24, flexShrink: 0
         }}>
           <div>
             <div style={{ fontSize: 11, fontWeight: 600, color: "#999", letterSpacing: "0.08em", marginBottom: 8, fontFamily: monoFont }}>TOPICS</div>
@@ -352,7 +567,7 @@ export default function NewsletterDashboard() {
           <div>
             <div style={{ fontSize: 11, fontWeight: 600, color: "#999", letterSpacing: "0.08em", marginBottom: 8, fontFamily: monoFont }}>SOURCES</div>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-              {ALL_SOURCES.map(s => (
+              {allSources.map(s => (
                 <button key={s} onClick={() => toggleFilter("sources", s)} style={{
                   background: filters.sources.includes(s) ? "#1a1a1a" : "#f5f4f1",
                   color: filters.sources.includes(s) ? "#fff" : "#555",
@@ -380,12 +595,12 @@ export default function NewsletterDashboard() {
       )}
 
       {/* ─── MAIN CONTENT ─── */}
-      <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
+      <div style={{ display: "flex", flex: 1, minHeight: 0, overflow: "hidden" }}>
 
-        {/* Article List */}
+        {/* Article List — independent scroll */}
         <div style={{
           width: 420, borderRight: "1px solid #e8e5e0", background: "#fffffe",
-          overflowY: "auto", flexShrink: 0
+          overflowY: "auto", flexShrink: 0, height: "100%"
         }}>
           {filtered.length === 0 ? (
             <div style={{ padding: 40, textAlign: "center", color: "#aaa" }}>
@@ -448,11 +663,11 @@ export default function NewsletterDashboard() {
           ))}
         </div>
 
-        {/* Reading Pane */}
-        <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
+        {/* Reading Pane — independent scroll */}
+        <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, height: "100%" }}>
           {selected ? (
             <>
-              {/* Article content */}
+              {/* Article content — scrollable */}
               <div style={{ flex: 1, overflowY: "auto", padding: "32px 48px" }}>
                 {/* Meta bar */}
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
@@ -512,7 +727,7 @@ export default function NewsletterDashboard() {
                 {/* Body */}
                 <div style={{
                   fontFamily: font, fontSize: 17, lineHeight: 1.7, color: "#2a2a2a",
-                  maxWidth: 640, marginBottom: 32
+                  maxWidth: 640, marginBottom: 32, whiteSpace: "pre-wrap"
                 }}>{selected.body}</div>
 
                 {/* Investment Ideas */}
@@ -565,7 +780,7 @@ export default function NewsletterDashboard() {
               {/* ─── FEEDBACK BAR ─── */}
               <div style={{
                 borderTop: "1px solid #e8e5e0", background: "#fffffe", padding: "12px 32px",
-                display: "flex", gap: 12, alignItems: "center"
+                display: "flex", gap: 12, alignItems: "center", flexShrink: 0
               }}>
                 <input
                   ref={feedbackRef}
@@ -598,7 +813,7 @@ export default function NewsletterDashboard() {
               {(feedbackNotes[selectedId] || []).length > 0 && (
                 <div style={{
                   borderTop: "1px solid #f0eeeb", background: "#faf9f7", padding: "10px 32px",
-                  maxHeight: 120, overflowY: "auto"
+                  maxHeight: 120, overflowY: "auto", flexShrink: 0
                 }}>
                   {feedbackNotes[selectedId].map((n, i) => (
                     <div key={i} style={{
@@ -633,10 +848,12 @@ export default function NewsletterDashboard() {
                   border: "1px solid #fed7aa", borderRadius: 12, maxWidth: 360, textAlign: "center"
                 }}>
                   <div style={{ fontSize: 13, color: "#c2410c", fontWeight: 600, marginBottom: 4 }}>
-                    Sample data loaded
+                    {GOOGLE_CLIENT_ID ? "Click \"Connect Gmail\" to get started" : "Sample data loaded"}
                   </div>
                   <div style={{ fontSize: 12, color: "#888", lineHeight: 1.5 }}>
-                    Connect Gmail to scan your real newsletters. For now, explore the interface with data from your last digest.
+                    {GOOGLE_CLIENT_ID
+                      ? "Sign in with Google to pull your latest newsletters from the Updates tab."
+                      : "Add VITE_GOOGLE_CLIENT_ID to your .env file to connect Gmail. For now, explore with sample data."}
                   </div>
                 </div>
               )}
