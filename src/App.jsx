@@ -226,7 +226,7 @@ export default function NewsletterDashboard() {
   const [loading, setLoading] = useState(false);
   const [toast, setToast] = useState(null);
   const [view, setView] = useState("inbox");
-  const [accessToken, setAccessToken] = useState(null);
+  const [accessToken, setAccessToken] = useState(() => sessionStorage.getItem("gmail_token") || null);
   const [fetchError, setFetchError] = useState(null);
   const [emailCount, setEmailCount] = useState(0);
   const feedbackRef = useRef(null);
@@ -234,7 +234,17 @@ export default function NewsletterDashboard() {
 
   const showToast = useCallback((msg) => {
     setToast(msg);
-    setTimeout(() => setToast(null), 2600);
+    setTimeout(() => setToast(null), 3500);
+  }, []);
+
+  // Save token to sessionStorage whenever it changes
+  const saveToken = useCallback((token) => {
+    setAccessToken(token);
+    if (token) {
+      sessionStorage.setItem("gmail_token", token);
+    } else {
+      sessionStorage.removeItem("gmail_token");
+    }
   }, []);
 
   // Initialize Google OAuth token client
@@ -246,7 +256,7 @@ export default function NewsletterDashboard() {
         tokenClientRef.current = window.google.accounts.oauth2.initTokenClient({
           client_id: GOOGLE_CLIENT_ID,
           scope: SCOPES,
-          callback: () => {}, // set dynamically
+          callback: () => {},
         });
       }
     }, 200);
@@ -258,7 +268,31 @@ export default function NewsletterDashboard() {
     setLoading(true);
     setFetchError(null);
     try {
-      // Broad search: updates tab, promotions tab, substack, and common newsletter patterns
+      // First: test that the token works with a simple profile call
+      const profileRes = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/profile", {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const profileData = await profileRes.json();
+
+      if (profileData.error) {
+        const errMsg = profileData.error.message || profileData.error.status || JSON.stringify(profileData.error);
+        console.error("Gmail API error:", profileData.error);
+        if (profileData.error.code === 401 || profileData.error.code === 403) {
+          // Token expired or insufficient permissions — clear and re-auth
+          saveToken(null);
+          setGmailConnected(false);
+          showToast("Session expired — click Connect Gmail again");
+        } else {
+          showToast("Gmail API error: " + errMsg);
+        }
+        setLoading(false);
+        return;
+      }
+
+      setGmailEmail(profileData.emailAddress || "");
+      setGmailConnected(true);
+
+      // Broad search queries
       const queries = [
         "category:updates newer_than:14d",
         "category:promotions newer_than:14d",
@@ -268,6 +302,8 @@ export default function NewsletterDashboard() {
       ];
 
       const allMessageIds = new Set();
+      const queryErrors = [];
+
       for (const q of queries) {
         try {
           const res = await fetch(
@@ -275,38 +311,56 @@ export default function NewsletterDashboard() {
             { headers: { Authorization: `Bearer ${token}` } }
           );
           const data = await res.json();
-          console.log(`Gmail query "${q}" returned ${data.messages?.length || 0} results`, data.error || "");
-          if (data.messages) {
-            data.messages.forEach(m => allMessageIds.add(m.id));
+          if (data.error) {
+            queryErrors.push(`"${q}": ${data.error.message}`);
+            console.error(`Query "${q}" error:`, data.error);
+          } else {
+            console.log(`"${q}" → ${data.messages?.length || 0} results (total estimate: ${data.resultSizeEstimate})`);
+            if (data.messages) {
+              data.messages.forEach(m => allMessageIds.add(m.id));
+            }
           }
         } catch (e) {
-          console.warn(`Query failed: ${q}`, e);
+          queryErrors.push(`"${q}": ${e.message}`);
         }
       }
 
-      // If still nothing, do a simple broad fallback: all emails from last 14 days
+      // If targeted queries found nothing, try a broad fallback
       if (allMessageIds.size === 0) {
-        console.log("No results from targeted queries, trying broad fallback...");
-        const res = await fetch(
-          `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent("newer_than:14d")}&maxResults=30`,
-          { headers: { Authorization: `Bearer ${token}` } }
-        );
-        const data = await res.json();
-        console.log(`Broad fallback returned ${data.messages?.length || 0} results`, data.error || "");
-        if (data.messages) {
-          data.messages.forEach(m => allMessageIds.add(m.id));
+        console.log("Targeted queries returned 0, trying broad fallback...");
+        try {
+          const res = await fetch(
+            `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=30`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
+          const data = await res.json();
+          if (data.error) {
+            queryErrors.push(`fallback: ${data.error.message}`);
+            console.error("Fallback error:", data.error);
+          } else {
+            console.log(`Fallback (all mail) → ${data.messages?.length || 0} results`);
+            if (data.messages) {
+              data.messages.forEach(m => allMessageIds.add(m.id));
+            }
+          }
+        } catch (e) {
+          queryErrors.push(`fallback: ${e.message}`);
         }
       }
 
       if (allMessageIds.size === 0) {
-        showToast("No emails found — check that Gmail API access is enabled");
+        const errDetail = queryErrors.length > 0
+          ? "API errors: " + queryErrors[0]
+          : "0 results from all queries";
+        showToast("No emails found — " + errDetail);
+        setFetchError(errDetail);
         setLoading(false);
         return;
       }
 
       setEmailCount(allMessageIds.size);
 
-      // Fetch full message details (limit to 30 to stay fast)
+      // Fetch full message details
       const ids = [...allMessageIds].slice(0, 30);
       const messageFetches = ids.map(id =>
         fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`, {
@@ -315,9 +369,10 @@ export default function NewsletterDashboard() {
       );
 
       const messages = (await Promise.all(messageFetches)).filter(Boolean);
-      const parsed = messages.map((msg, i) => parseGmailToArticle(msg, i));
+      const parsed = messages
+        .filter(m => !m.error) // skip any that errored
+        .map((msg, i) => parseGmailToArticle(msg, i));
 
-      // Sort by date descending
       parsed.sort((a, b) => b.date.localeCompare(a.date));
 
       setArticles(parsed);
@@ -325,10 +380,18 @@ export default function NewsletterDashboard() {
     } catch (err) {
       console.error("Gmail fetch error:", err);
       setFetchError(err.message);
-      showToast("Error fetching Gmail: " + err.message);
+      showToast("Error: " + err.message);
     }
     setLoading(false);
-  }, [showToast]);
+  }, [showToast, saveToken]);
+
+  // Auto-reconnect on page load if we have a saved token
+  useEffect(() => {
+    if (accessToken && !gmailConnected) {
+      fetchGmail(accessToken);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleConnectGmail = useCallback(() => {
     if (!GOOGLE_CLIENT_ID) {
@@ -345,22 +408,13 @@ export default function NewsletterDashboard() {
         showToast("Auth error: " + response.error);
         return;
       }
-      setAccessToken(response.access_token);
+      saveToken(response.access_token);
       setGmailConnected(true);
-
-      // Get user email for display
-      try {
-        const profile = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/profile", {
-          headers: { Authorization: `Bearer ${response.access_token}` }
-        }).then(r => r.json());
-        setGmailEmail(profile.emailAddress || "");
-      } catch {}
-
       fetchGmail(response.access_token);
     };
 
     tokenClientRef.current.requestAccessToken({ prompt: "consent" });
-  }, [fetchGmail, showToast]);
+  }, [fetchGmail, showToast, saveToken]);
 
   const handleRefresh = useCallback(() => {
     if (accessToken) {
