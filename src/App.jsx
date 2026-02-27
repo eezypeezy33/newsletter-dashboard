@@ -258,48 +258,70 @@ export default function NewsletterDashboard() {
     setLoading(true);
     setFetchError(null);
     try {
-      // Search updates category + common newsletter sources
+      // Broad search: updates tab, promotions tab, substack, and common newsletter patterns
       const queries = [
         "category:updates newer_than:14d",
+        "category:promotions newer_than:14d",
         "from:substack.com newer_than:14d",
+        "newer_than:14d (newsletter OR digest OR weekly OR briefing OR recap)",
+        "newer_than:14d list:*.substack.com",
       ];
 
       const allMessageIds = new Set();
       for (const q of queries) {
+        try {
+          const res = await fetch(
+            `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(q)}&maxResults=30`,
+            { headers: { Authorization: `Bearer ${token}` } }
+          );
+          const data = await res.json();
+          console.log(`Gmail query "${q}" returned ${data.messages?.length || 0} results`, data.error || "");
+          if (data.messages) {
+            data.messages.forEach(m => allMessageIds.add(m.id));
+          }
+        } catch (e) {
+          console.warn(`Query failed: ${q}`, e);
+        }
+      }
+
+      // If still nothing, do a simple broad fallback: all emails from last 14 days
+      if (allMessageIds.size === 0) {
+        console.log("No results from targeted queries, trying broad fallback...");
         const res = await fetch(
-          `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(q)}&maxResults=30`,
+          `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent("newer_than:14d")}&maxResults=30`,
           { headers: { Authorization: `Bearer ${token}` } }
         );
         const data = await res.json();
+        console.log(`Broad fallback returned ${data.messages?.length || 0} results`, data.error || "");
         if (data.messages) {
           data.messages.forEach(m => allMessageIds.add(m.id));
         }
       }
 
       if (allMessageIds.size === 0) {
-        showToast("No newsletters found in the last 2 weeks");
+        showToast("No emails found — check that Gmail API access is enabled");
         setLoading(false);
         return;
       }
 
       setEmailCount(allMessageIds.size);
 
-      // Fetch full message details (limit to 25 to stay fast)
-      const ids = [...allMessageIds].slice(0, 25);
+      // Fetch full message details (limit to 30 to stay fast)
+      const ids = [...allMessageIds].slice(0, 30);
       const messageFetches = ids.map(id =>
         fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`, {
           headers: { Authorization: `Bearer ${token}` }
-        }).then(r => r.json())
+        }).then(r => r.json()).catch(() => null)
       );
 
-      const messages = await Promise.all(messageFetches);
+      const messages = (await Promise.all(messageFetches)).filter(Boolean);
       const parsed = messages.map((msg, i) => parseGmailToArticle(msg, i));
 
       // Sort by date descending
       parsed.sort((a, b) => b.date.localeCompare(a.date));
 
       setArticles(parsed);
-      showToast(`Loaded ${parsed.length} newsletters from Gmail`);
+      showToast(`Loaded ${parsed.length} emails from Gmail`);
     } catch (err) {
       console.error("Gmail fetch error:", err);
       setFetchError(err.message);
