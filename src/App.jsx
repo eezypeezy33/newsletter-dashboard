@@ -126,34 +126,35 @@ function decodeBase64Url(str) {
   }
 }
 
-function extractEmailBody(payload) {
-  // Try to get text/plain or text/html from parts
-  if (payload.parts) {
-    for (const part of payload.parts) {
-      if (part.mimeType === "text/plain" && part.body?.data) {
-        return decodeBase64Url(part.body.data);
-      }
-      // Recurse into nested parts (multipart/alternative, etc.)
-      if (part.parts) {
-        const nested = extractEmailBody(part);
-        if (nested) return nested;
-      }
-    }
-    // Fallback to text/html
-    for (const part of payload.parts) {
-      if (part.mimeType === "text/html" && part.body?.data) {
-        const html = decodeBase64Url(part.body.data);
-        // Strip HTML tags for plain text
-        const doc = new DOMParser().parseFromString(html, "text/html");
-        return doc.body.textContent || "";
-      }
-    }
-  }
-  // Single-part message
-  if (payload.body?.data) {
+function findPart(payload, mime) {
+  if (payload.mimeType === mime && payload.body?.data) {
     return decodeBase64Url(payload.body.data);
   }
-  return "";
+  if (payload.parts) {
+    for (const part of payload.parts) {
+      const result = findPart(part, mime);
+      if (result) return result;
+    }
+  }
+  return null;
+}
+
+function extractEmailBody(payload) {
+  // Get both HTML and plain text versions
+  const html = findPart(payload, "text/html");
+  const plain = findPart(payload, "text/plain");
+
+  // Fallback for single-part messages
+  const rawBody = payload.body?.data ? decodeBase64Url(payload.body.data) : "";
+
+  // Plain text for snippets/search (strip HTML if needed)
+  let plainText = plain || rawBody;
+  if (!plainText && html) {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    plainText = doc.body.textContent || "";
+  }
+
+  return { html: html || null, plain: plainText };
 }
 
 function getHeader(headers, name) {
@@ -186,11 +187,11 @@ function parseGmailToArticle(msg, idx) {
     dateStr = new Date().toISOString().split("T")[0];
   }
 
-  const body = extractEmailBody(msg.payload || {});
-  const snippet = msg.snippet || body.slice(0, 200);
+  const { html, plain } = extractEmailBody(msg.payload || {});
+  const snippet = msg.snippet || (plain || "").slice(0, 200);
 
-  // Simple ticker detection: find $TICKER patterns
-  const tickerMatches = body.match(/\$([A-Z]{1,5}(?:\.[A-Z]{1,2})?)/g) || [];
+  // Simple ticker detection: find $TICKER patterns in plain text
+  const tickerMatches = (plain || "").match(/\$([A-Z]{1,5}(?:\.[A-Z]{1,2})?)/g) || [];
   const tickers = [...new Set(tickerMatches.map(t => t.replace("$", "")))];
 
   return {
@@ -200,7 +201,8 @@ function parseGmailToArticle(msg, idx) {
     source,
     date: dateStr,
     snippet: snippet.slice(0, 250),
-    body: body.slice(0, 3000),
+    body: (plain || "").slice(0, 3000),
+    htmlBody: html,
     topics: [],
     relevance: "medium",
     tickers,
@@ -801,10 +803,31 @@ export default function NewsletterDashboard() {
                 </div>
 
                 {/* Body */}
-                <div style={{
-                  fontFamily: font, fontSize: 17, lineHeight: 1.7, color: "#2a2a2a",
-                  maxWidth: 640, marginBottom: 32, whiteSpace: "pre-wrap"
-                }}>{selected.body}</div>
+                {selected.htmlBody ? (
+                  <iframe
+                    srcDoc={selected.htmlBody}
+                    sandbox="allow-same-origin"
+                    style={{
+                      width: "100%", minHeight: 600, border: "none",
+                      borderRadius: 8, marginBottom: 32, background: "#fff"
+                    }}
+                    onLoad={(e) => {
+                      // Auto-resize iframe to fit content
+                      try {
+                        const doc = e.target.contentDocument || e.target.contentWindow.document;
+                        e.target.style.height = doc.documentElement.scrollHeight + "px";
+                        // Make all links open in new tab
+                        const links = doc.querySelectorAll("a");
+                        links.forEach(a => { a.setAttribute("target", "_blank"); a.setAttribute("rel", "noopener noreferrer"); });
+                      } catch {}
+                    }}
+                  />
+                ) : (
+                  <div style={{
+                    fontFamily: font, fontSize: 17, lineHeight: 1.7, color: "#2a2a2a",
+                    maxWidth: 640, marginBottom: 32, whiteSpace: "pre-wrap"
+                  }}>{selected.body}</div>
+                )}
 
                 {/* Investment Ideas */}
                 {selected.ideas.length > 0 && (
